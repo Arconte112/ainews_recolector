@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # --- Environment Variables & Constants ---
-NEWS_URLS = json.loads(os.getenv('NEWS_URLS', '[]'))
+# NEWS_URLS = json.loads(os.getenv('NEWS_URLS', '[]')) # Replaced with hardcoded list
+NEWS_URLS = ["https://techcrunch.com/category/artificial-intelligence/feed/", "https://www.wired.com/feed/tag/ai/latest/rss", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "https://arstechnica.com/tag/artificial-intelligence/feed/", "https://feed.infoq.com/ai-ml-data-eng/news", "https://futurism.com/categories/ai-artificial-intelligence/feed", "https://www.theguardian.com/technology/artificialintelligenceai/rss", "https://www.reddit.com/r/artificial/.rss"]
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
 if not WEBHOOK_URL:
