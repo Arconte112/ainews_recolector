@@ -1,99 +1,95 @@
 import requests
 from bs4 import BeautifulSoup # Added back for HTML cleaning
-import schedule
 import time
 import sqlite3
 import json
 import os
-from openai import OpenAI
-from urllib.parse import urljoin # Keep for potential relative links in feeds? Maybe not needed. Let's keep for now.
+from urllib.parse import urljoin
 import logging
 from dotenv import load_dotenv
-# Removed: import newspaper # No longer using newspaper3k
 import feedparser # Added feedparser
 import socket # Ensure socket is imported globally if used in both functions
 import asyncio # Added asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto # Added telegram components
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue # Added telegram extensions
+import html # Added for unescaping HTML entities
+import sys # Added for sys.executable
+import uuid # Added for unique filenames
+import base64 # Add back base64 import
+from requests.adapters import HTTPAdapter, Retry # Import Retry and HTTPAdapter
+
+# --- Telegram Imports ---
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue # Added JobQueue
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
-import html # Added for unescaping HTML entities
-import base64 # Added for image processing
-import random # Added for selecting random feed in /test
-
-# --- Configuration ---
-load_dotenv() # Load environment variables from .env file
 
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s' # Added logger name
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-# Set higher logging level for httpx to avoid verbose DEBUG messages
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__) # Use specific logger
+# Reduce telegram logger verbosity
+logging.getLogger("telegram.vendor.ptb_urllib3.urllib3.connectionpool").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.ExtBot").setLevel(logging.WARNING)
+logging.getLogger("telegram.bot").setLevel(logging.INFO) # Keep INFO for bot actions
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+load_dotenv()
 
 # --- Environment Variables & Constants ---
-# List of RSS Feed URLs to scrape
-# Example: NEWS_URLS='["http://feeds.bbci.co.uk/news/technology/rss.xml", "https://techcrunch.com/feed/"]'
-NEWS_URLS = json.loads(os.getenv('NEWS_URLS', '[]')) # Default to empty list if not set
-WEBHOOK_URL = os.getenv('WEBHOOK_URL') # Your webhook URL
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# --- OpenAI Image Generation Config ---
-# NOTE: OPENAI_API_KEY is now REQUIRED if IMAGE_GENERATION_ENABLED is True
-# It will always use the official OpenAI endpoint for images.
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') # Removed fallback to OPENROUTER_API_KEY here
-OPENAI_IMAGE_MODEL = os.getenv('OPENAI_IMAGE_MODEL', "gpt-image-1") # Model for image generation
-IMAGE_GENERATION_ENABLED = os.getenv('IMAGE_GENERATION_ENABLED', 'True').lower() == 'true'
-IMAGE_SIZE = os.getenv('IMAGE_SIZE', '1024x1024') # e.g., 1024x1024, 1024x1536, 1536x1024
-IMAGE_QUALITY = os.getenv('IMAGE_QUALITY', 'medium') # e.g., standard, hd
+NEWS_URLS = json.loads(os.getenv('NEWS_URLS', '[]'))
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
+if not WEBHOOK_URL:
+    logger.error("❌ WEBHOOK_URL no está configurado en el archivo .env. El script no puede funcionar sin él.")
+    exit(1)
+else:
+    logger.info(f"WEBHOOK_URL configurado como: {WEBHOOK_URL}")
 
-# --- Catbox Config ---
-CATBOX_API_URL = "https://catbox.moe/user/api.php"
-CATBOX_USER_HASH = os.getenv('CATBOX_USER_HASH', '') # Optional: Set if you have a Catbox user hash
-
-GPT_MODEL = os.getenv('GPT_MODEL', "openai/gpt-4o-mini") # Changed default model slightly
-DATABASE_NAME = 'news_log.db'
-CHECK_INTERVAL_SECONDS = int(os.getenv('CHECK_INTERVAL_MINUTES', 15)) * 60
-MAX_RECENT_ARTICLES_FOR_CHECK = int(os.getenv('MAX_RECENT_ARTICLES_FOR_CHECK', 30)) # Increased default slightly
-# Removed: ARTICLE_DOWNLOAD_TIMEOUT # Not directly applicable to feedparser in the same way
-# Removed: MAX_ARTICLES_PER_SOURCE # feedparser gives all entries, we process them
-FEED_REQUEST_TIMEOUT = int(os.getenv('FEED_REQUEST_TIMEOUT', 30)) # Timeout for fetching the feed itself
-WEBHOOK_TIMEOUT = int(os.getenv('WEBHOOK_TIMEOUT', 45))
-# Telegram
+# --- Telegram Configuration ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-# Content Limits
-TELEGRAM_CAPTION_LIMIT = 1024 # Telegram caption limit
-SUMMARY_PREVIEW_LIMIT = 700 # Limit summary length in Telegram message initially
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    logger.error("❌ TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID no están configurados en .env. Se requiere para enviar noticias a Telegram.")
+    exit(1)
+else:
+    logger.info(f"Telegram Bot Token y Chat ID configurados. Enviando a: {TELEGRAM_CHAT_ID}")
 
-# --- Newspaper3k Configuration ---
-# Removed newspaper3k config section
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_IMAGE_MODEL = os.getenv('OPENAI_IMAGE_MODEL', "gpt-image-1") # Changed default model
+IMAGE_GENERATION_ENABLED = os.getenv('IMAGE_GENERATION_ENABLED', 'True').lower() == 'true'
+IMAGE_SIZE = os.getenv('IMAGE_SIZE', '1024x1024')
+IMAGE_QUALITY = os.getenv('IMAGE_QUALITY', 'medium') # Changed default quality
+
+# CATBOX_API_URL = "https://catbox.moe/user/api.php" # Removed Catbox URL
+IMGBB_API_URL = "https://api.imgbb.com/1/upload"
+IMGBB_API_KEY = "fa96877128b39591c1286e74e07e0987" # Your ImgBB API Key
+
+GPT_MODEL = os.getenv('GPT_MODEL', "openai/gpt-4o-mini")
+DATABASE_NAME = 'news_log.db'
+CHECK_INTERVAL_SECONDS = int(os.getenv('CHECK_INTERVAL_MINUTES', 15)) * 60
+MAX_RECENT_ARTICLES_FOR_CHECK = int(os.getenv('MAX_RECENT_ARTICLES_FOR_CHECK', 30))
+FEED_REQUEST_TIMEOUT = int(os.getenv('FEED_REQUEST_TIMEOUT', 30))
+WEBHOOK_TIMEOUT = int(os.getenv('WEBHOOK_TIMEOUT', 45))
+TELEGRAM_TIMEOUT = int(os.getenv('TELEGRAM_TIMEOUT', 30)) # Added timeout for Telegram
+
+# Define a directory for temporary images
+TEMP_IMAGE_DIR = "temp_images"
 
 # --- OpenAI Client Setup ---
-# Client for Text/Deduplication (using OpenRouter)
 openrouter_client = None
 if OPENROUTER_API_KEY:
+    from openai import OpenAI
     openrouter_client = OpenAI(
         base_url=OPENROUTER_BASE_URL,
         api_key=OPENROUTER_API_KEY,
     )
+    logger.info("OpenRouter client configured for deduplication.")
 else:
-    logging.warning("OPENROUTER_API_KEY not found. Deduplication feature will be disabled.")
-
-# Client for Image Generation (using official OpenAI API)
-image_client = None
-if IMAGE_GENERATION_ENABLED:
-    if OPENAI_API_KEY:
-        logger.info(f"Image generation enabled. Using official OpenAI endpoint with model {OPENAI_IMAGE_MODEL}.")
-        # Initialize with only api_key to use the default OpenAI base URL
-        image_client = OpenAI(api_key=OPENAI_API_KEY)
-    else:
-        logger.warning("IMAGE_GENERATION_ENABLED is True, but OPENAI_API_KEY is not set. Disabling image generation.")
-        IMAGE_GENERATION_ENABLED = False # Force disable
-else:
-    logger.info("Image generation is disabled via environment variable.")
+    logger.warning("OPENROUTER_API_KEY not found. Deduplication feature will be disabled.")
 
 # --- Database Functions ---
 def init_db():
@@ -106,9 +102,9 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     url TEXT UNIQUE NOT NULL,
                     title TEXT NOT NULL,
-                    summary TEXT,         -- Added summary column
-                    image_url TEXT,     -- Added image_url column
-                    source_feed TEXT,   -- Added source_feed column
+                    summary TEXT,
+                    image_url TEXT,
+                    source_feed TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -165,17 +161,15 @@ def add_article(url, title, summary, image_url, source_feed) -> int | None:
             article_id = cursor.lastrowid # Get the ID of the inserted row
             conn.commit()
         if article_id:
-            log_title = title[:60] + '...' if len(title) > 60 else title
-            logger.info(f"Article added to DB (ID: {article_id}): '{log_title}' ({url})")
+            log_title_short = title[:50] + '...' if len(title) > 50 else title
+            logger.info(f"Artículo añadido a BD (ID: {article_id}): '{log_title_short}'")
         return article_id
     except sqlite3.IntegrityError:
-        # This likely means the URL was already added (UNIQUE constraint) - expected race condition possibility
-        logger.warning(f"Attempted to add duplicate article URL to DB (IntegrityError): {url}")
-        # Optionally, retrieve the existing ID if needed, but returning None is simpler
+        logger.debug(f"Intento de añadir URL duplicada a BD (Ignorado): {url}")
         return None
     except sqlite3.Error as e:
         logger.error(f"Database error adding article {url}: {e}", exc_info=True)
-        return None # Indicate failure
+        return None
 
 async def get_recent_articles_async(limit=MAX_RECENT_ARTICLES_FOR_CHECK):
     """Retrieves recent article titles and URLs for deduplication asynchronously."""
@@ -192,30 +186,6 @@ def get_recent_articles(limit=MAX_RECENT_ARTICLES_FOR_CHECK):
             articles = [dict(row) for row in cursor.fetchall()]
     except sqlite3.Error as e:
         logger.error(f"Database error retrieving recent articles (for dedupe): {e}", exc_info=True)
-    return articles
-
-async def get_recent_articles_details_async(limit: int = 5):
-    """Retrieves full details of the most recent articles asynchronously."""
-    # New function to get full details
-    return await asyncio.to_thread(get_recent_articles_details, limit)
-
-def get_recent_articles_details(limit: int = 5):
-    """Retrieves full details of the most recent articles (blocking)."""
-    # New function to get full details
-    articles = []
-    try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
-            conn.row_factory = sqlite3.Row # Make sure rows can be treated like dicts
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, url, title, summary, image_url, source_feed
-                FROM articles
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (limit,))
-            articles = [dict(row) for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logger.error(f"Database error retrieving recent article details: {e}", exc_info=True)
     return articles
 
 async def get_article_details_async(article_id: int):
@@ -239,41 +209,54 @@ def get_article_details(article_id: int):
         logger.error(f"Database error retrieving article details for ID {article_id}: {e}", exc_info=True)
     return details
 
-# --- Webhook Function (Now called from Telegram Callback) ---
+# --- Webhook Function ---
 async def send_to_webhook_async(data):
      """Sends data to the webhook asynchronously."""
-     return await asyncio.to_thread(send_to_webhook, data)
+     if not WEBHOOK_URL:
+         logger.error("WEBHOOK_URL not configured. Cannot send data.")
+         return False
+     try:
+         headers = {'Content-Type': 'application/json'}
+         logger.debug(f"Enviando datos a webhook URL: {WEBHOOK_URL}")
+         logger.debug(f"Contenido de la petición: {json.dumps(data)}")
 
-def send_to_webhook(data):
-    """Sends data as JSON to the configured webhook URL (blocking)."""
-    if not WEBHOOK_URL:
-        logger.error("WEBHOOK_URL not configured. Cannot send data.")
-        return False
-    try:
-        headers = {'Content-Type': 'application/json'}
-        response = requests.post(WEBHOOK_URL, headers=headers, json=data, timeout=WEBHOOK_TIMEOUT)
-        response.raise_for_status()
-        logger.info(f"Successfully sent data to webhook: {data.get('title', 'N/A')}")
-        return True
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error sending data to webhook for {data.get('url', 'N/A')}: {e}", exc_info=True)
-        return False
-    except Exception as e:
-        logger.error(f"An unexpected error occurred sending data to webhook for {data.get('url', 'N/A')}: {e}", exc_info=True)
-        return False
+         response = await asyncio.to_thread(
+             requests.post, WEBHOOK_URL, headers=headers, json=data, timeout=WEBHOOK_TIMEOUT
+         )
+
+         logger.debug(f"Respuesta del webhook: Status={response.status_code}, Content={response.text[:500]}")
+
+         response.raise_for_status()
+         log_title = data.get('title', 'N/A')
+         log_title_short = log_title[:60] + '...' if len(log_title) > 60 else log_title
+         logger.info(f"Artículo enviado correctamente al webhook: '{log_title_short}'")
+         return True
+     except requests.exceptions.Timeout:
+         log_title = data.get('title', 'N/A')
+         logger.error(f"Timeout al enviar datos al webhook para '{log_title}'. URL: {WEBHOOK_URL}")
+         return False
+     except requests.exceptions.RequestException as e:
+         log_title = data.get('title', 'N/A')
+         status_code = e.response.status_code if e.response is not None else "N/A"
+         logger.error(f"Error ({status_code}) al enviar datos al webhook para '{log_title}': {e}")
+         return False
+     except Exception as e:
+         log_title = data.get('title', 'N/A')
+         logger.error(f"Error inesperado al enviar datos al webhook para '{log_title}': {e}", exc_info=True)
+         return False
 
 # --- Deduplication Function ---
 async def is_duplicate_async(new_article_title, new_article_summary, recent_articles):
      """Runs the AI deduplication check asynchronously."""
-     if not openrouter_client or not recent_articles: # Use openrouter_client specifically
-         logger.info("Skipping AI deduplication check (no client or no recent articles).")
+     if not openrouter_client or not recent_articles:
+         logger.debug("Skipping AI deduplication check (no client or no recent articles).")
          return False
-     # The OpenAI client might be async depending on version, but let's wrap for safety/consistency
      return await asyncio.to_thread(is_duplicate, new_article_title, new_article_summary, recent_articles)
 
 def is_duplicate(new_article_title, new_article_summary, recent_articles):
     """Uses GPT via OpenRouter to check if the new article is a duplicate (blocking)."""
-    # client and recent_articles check moved to async wrapper
+    if not openrouter_client:
+        return False
     recent_titles = "\n".join([f"- {a['title']}" for a in recent_articles])
     summary_snippet = (new_article_summary or "")[:1500]
 
@@ -291,7 +274,6 @@ def is_duplicate(new_article_title, new_article_summary, recent_articles):
     """
 
     try:
-        # Use the specific client for deduplication
         completion = openrouter_client.chat.completions.create(
             model=GPT_MODEL,
             messages=[
@@ -303,398 +285,139 @@ def is_duplicate(new_article_title, new_article_summary, recent_articles):
         )
         response_text = completion.choices[0].message.content.strip().lower()
         is_dup = response_text.startswith('yes')
-        logger.info(f"AI determined duplicate status for '{new_article_title}': {is_dup}")
+        logger.debug(f"AI determined duplicate status for '{new_article_title}': {is_dup}")
         return is_dup
     except Exception as e:
         logger.error(f"Error during AI deduplication check for '{new_article_title}': {e}", exc_info=True)
-        return False # Assume not duplicate on error
+        return False
 
-# --- Image Generation & Upload Functions ---
+# --- ImgBB Upload Functions --- (Renamed from Catbox)
 
-def _generate_image_openai_sync(prompt: str) -> bytes | None:
-    """Synchronous helper to generate image using OpenAI API."""
-    if not image_client:
-        logger.warning("Image generation client not available.")
-        return None
+# Session creation can remain similar, retry logic is generally good
+def _create_upload_session() -> requests.Session:
+    """Creates a requests Session with retry logic for uploads."""
+    session = requests.Session()
+    retries = Retry(total=3,
+                    backoff_factor=0.3,
+                    status_forcelist=[500, 502, 503, 504],
+                    allowed_methods=None,
+                    respect_retry_after_header=True)
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    return session
+
+def _upload_to_imgbb_sync(session: requests.Session, image_base64: str, filename: str | None = None) -> str | None:
+    """
+    Synchronous helper to upload a base64 image string to ImgBB anonymously
+    using a session with retries. Parses JSON response for URL.
+    """
     try:
-        logger.info(f"Generating image with prompt: {prompt[:100]}...")
-        response = image_client.images.generate(
-            model=OPENAI_IMAGE_MODEL,
-            prompt=prompt,
-            n=1,
-            size=IMAGE_SIZE,
-            quality=IMAGE_QUALITY
-        )
-        b64_data = response.data[0].b64_json
-        if not b64_data:
-             logger.error("OpenAI response did not contain b64_json data.")
-             return None
-        image_bytes = base64.b64decode(b64_data)
-        logger.info(f"Image generated successfully ({len(image_bytes)} bytes).")
-        return image_bytes
-    except Exception as e:
-        logger.error(f"Error generating image with OpenAI: {e}", exc_info=True)
-        return None
+        # ImgBB expects base64 string in the 'image' field of the payload
+        payload = {
+            'key': IMGBB_API_KEY,
+            'image': image_base64,
+        }
+        # Optional: Add filename if provided
+        # if filename:
+        #     payload['name'] = filename
 
-async def generate_image_async(prompt: str) -> bytes | None:
-    """Generates an image using OpenAI API asynchronously."""
-    return await asyncio.to_thread(_generate_image_openai_sync, prompt)
+        # Optional: Add expiration if desired (e.g., 1 day = 86400 seconds)
+        # payload['expiration'] = "86400"
 
-def _upload_to_catbox_sync(image_bytes: bytes, filename: str = "image.png") -> str | None:
-    """Synchronous helper to upload image bytes to Catbox."""
-    try:
-        files = {'fileToUpload': (filename, image_bytes)}
-        data = {'reqtype': 'fileupload', 'userhash': CATBOX_USER_HASH}
-        logger.info(f"Uploading {len(image_bytes)} bytes to Catbox...")
-        response = requests.post(CATBOX_API_URL, files=files, data=data, timeout=60) # Increased timeout for upload
-        response.raise_for_status() # Check for HTTP errors
-        image_url = response.text
-        # Basic validation for URL
-        if image_url.startswith("http://") or image_url.startswith("https://"):
-            logger.info(f"Image uploaded successfully to Catbox: {image_url}")
-            return image_url
-        else:
-            logger.error(f"Catbox returned an unexpected response: {response.text}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error uploading image to Catbox: {e}", exc_info=True)
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error during Catbox upload: {e}", exc_info=True)
-        return None
+        logger.debug(f"Uploading base64 image ({len(image_base64)} chars) to ImgBB...")
+        response = session.post(IMGBB_API_URL, data=payload, timeout=120)
+        response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
 
-async def upload_to_catbox_async(image_bytes: bytes, filename: str = "image.png") -> str | None:
-    """Uploads image bytes to Catbox asynchronously."""
-    if not image_bytes:
-        return None
-    return await asyncio.to_thread(_upload_to_catbox_sync, image_bytes, filename)
-
-async def generate_and_upload_image_async(title: str, summary: str | None) -> str | None:
-    """Generates an image based on title/summary and uploads it to Catbox."""
-    if not IMAGE_GENERATION_ENABLED or not image_client:
-        logger.info("Image generation is disabled or client not configured. Skipping.")
-        return None
-
-    # Create a concise prompt for the image model
-    summary_snippet = (summary or "")[:500] # Limit summary length for prompt
-    # Refined prompt: Removed explicit size string, focused on style.
-    prompt = (
-        f"Generate an engaging Instagram-style thumbnail representing the following news article. "
-        f"Focus on the core subject visually. Avoid text, or use at most 1-2 relevant words clearly. "
-        f"News Title: {title}. Summary: {summary_snippet}..."
-    )
-
-    image_bytes = await generate_image_async(prompt)
-
-    if not image_bytes:
-        logger.warning(f"Image generation failed for title: {title}. No image bytes received.")
-        return None
-    else:
-        logger.info(f"Image generated successfully for title: {title}. Proceeding to upload.")
-
-
-    # Create a somewhat unique filename (optional, Catbox handles uniqueness)
-    safe_title = "".join(c if c.isalnum() else '_' for c in title[:30])
-    filename = f"{safe_title}_{int(time.time())}.png"
-
-    catbox_url = await upload_to_catbox_async(image_bytes, filename)
-
-    if not catbox_url:
-        logger.warning(f"Catbox upload failed for title: {title}.")
-        return None
-    else:
-        logger.info(f"Image uploaded to Catbox for title: {title} -> {catbox_url}")
-        return catbox_url
-
-# --- Telegram Interaction Functions ---
-async def send_to_telegram_group(context: ContextTypes.DEFAULT_TYPE, article_id: int, title: str, url: str, summary: str, image_url: str | None, source_feed: str):
-    """Formats and sends a message with image/button to Telegram group, using article_id for callback."""
-    bot = context.bot
-    summary_preview = summary[:SUMMARY_PREVIEW_LIMIT] + ('...' if len(summary) > SUMMARY_PREVIEW_LIMIT else '')
-    caption = f"📰 *{title}*\n\n{summary_preview}\n\n🔗 {url}\n\nFeed: _{source_feed}_"
-
-    if len(caption) > TELEGRAM_CAPTION_LIMIT:
-        cutoff = len(caption) - TELEGRAM_CAPTION_LIMIT - 3
-        summary_preview = summary[:SUMMARY_PREVIEW_LIMIT - cutoff] + '...'
-        caption = f"📰 *{title}*\n\n{summary_preview}\n\n🔗 {url}\n\nFeed: _{source_feed}_"
-
-    # Prepare button using article_id (as string) for callback_data
-    callback_data_str = str(article_id)
-    if len(callback_data_str.encode('utf-8')) > 64:
-        logger.error(f"Generated article_id string '{callback_data_str}' is too long for callback_data! Skipping button.")
-        reply_markup = None # Should not happen with IDs, but safety check
-    else:
-        keyboard = [[InlineKeyboardButton("⬆️ Subir Noticia", callback_data=callback_data_str)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message_id = None
-    try:
-        if image_url:
-            logger.debug(f"Attempting to send photo: {image_url} with button data: {callback_data_str}")
-            sent_message = await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID, photo=image_url, caption=caption,
-                parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup
-            )
-            message_id = sent_message.message_id
-        else:
-            logger.debug(f"No image_url found, sending text message with button data: {callback_data_str}")
-            sent_message = await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup, disable_web_page_preview=True
-            )
-            message_id = sent_message.message_id
-        logger.info(f"Message sent to Telegram for article ID {article_id}: {title}")
-        return message_id
-    except TelegramError as e:
-        # Log the specific error if it happens again
-        logger.error(f"Telegram API error sending message for article ID {article_id} ('{title}'): {e}", exc_info=True)
-        # Fallback logic remains the same
-        if image_url and "PHOTO_INVALID" in str(e) or "wrong file identifier" in str(e) or "Failed to get http url content" in str(e):
-             logger.warning(f"Failed to send photo for {title}. Trying text message instead.")
-             try:
-                 # Need to resend caption and button data
-                 sent_message = await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=reply_markup, disable_web_page_preview=True
-                 )
-                 message_id = sent_message.message_id
-                 return message_id
-             except TelegramError as e2:
-                  logger.error(f"Telegram API error sending fallback text message for article ID {article_id} ('{title}'): {e2}", exc_info=True)
-        return None # Indicate failure
-    except Exception as e:
-        logger.error(f"Unexpected error sending Telegram message for article ID {article_id} ('{title}'): {e}", exc_info=True)
-        return None
-
-async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the 'Upload News' button press, retrieving article by ID."""
-    callback_query = update.callback_query
-    await callback_query.answer("Procesando...")
-
-    # Get article_id (string) from data and convert to int
-    try:
-        article_id_str = callback_query.data
-        article_id = int(article_id_str)
-        logger.info(f"Button pressed for article ID: {article_id}")
-    except (ValueError, TypeError):
-        logger.error(f"Invalid callback_data received: '{callback_query.data}'. Expected an integer article ID.")
+        # Parse the JSON response
         try:
-            await callback_query.edit_message_text(text="❌ Error: Datos del botón inválidos.")
-        except TelegramError as e:
-            logger.error(f"Error editing message after invalid button data: {e}")
-        return
-
-    # Retrieve full article details from DB using the ID
-    article_details = await get_article_details_async(article_id)
-
-    if not article_details:
-        logger.error(f"Could not retrieve article details from DB for ID: {article_id}")
-        try:
-            # Check if message exists before trying to edit
-            if callback_query.message:
-                 # Check if message has text or caption before editing appropriate field
-                 if callback_query.message.text:
-                      await callback_query.edit_message_text(text="❌ Error: No se encontraron los detalles del artículo (ID: {}).".format(article_id))
-                 elif callback_query.message.caption:
-                      await callback_query.edit_message_caption(caption="❌ Error: No se encontraron los detalles del artículo (ID: {}).".format(article_id))
-                 else: # Fallback just in case? Unlikely.
-                      logger.warning(f"Message {callback_query.message.message_id} for article ID {article_id} has neither text nor caption to edit.")
+            json_response = response.json()
+            if json_response.get("success") and json_response.get("data") and json_response["data"].get("url"):
+                image_url = json_response["data"]["url"]
+                display_url = json_response["data"].get("display_url", image_url) # Prefer display_url if available
+                logger.info(f"Image uploaded successfully to ImgBB: {display_url}")
+                return display_url # Return the direct image URL or display URL
             else:
-                 logger.warning(f"Callback query {callback_query.id} for article ID {article_id} has no associated message to edit.")
-        except TelegramError as e:
-             logger.error(f"Error editing message after DB details failure for ID {article_id}: {e}")
-        return
+                error_message = json_response.get("error", {}).get("message", "Unknown ImgBB API error")
+                status_code = json_response.get("status_code", "N/A")
+                logger.error(f"ImgBB API error (Status: {status_code}): {error_message}")
+                logger.debug(f"Full ImgBB error response: {json_response}")
+                return None
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON response from ImgBB: {response.text[:500]}...")
+            return None
 
-    if not WEBHOOK_URL:
-         # Logic remains the same
-         logger.warning(f"Webhook URL not set. Cannot process button press for article ID {article_id}")
-         try:
-            await callback_query.edit_message_text(text="⚠️ Webhook no configurado. No se puede subir.")
-         except TelegramError as e:
-             logger.error(f"Error editing message for missing webhook: {e}")
-         return
-
-    # Prepare data for webhook
-    webhook_data = {
-        'title': article_details['title'],
-        'url': article_details['url'], # Still send the URL to the webhook
-        'content_preview': (article_details['summary'] or "")[:1000] + ('...' if len(article_details['summary'] or "") > 1000 else ''),
-        'image_url': article_details['image_url'],
-        'source': article_details['source_feed']
-    }
-
-    # Send data to webhook
-    success = await send_to_webhook_async(webhook_data)
-
-    # Edit the original Telegram message
-    # Logic remains largely the same, just using article_id in logs
-    try:
-        original_message = callback_query.message
-        new_text = original_message.text or original_message.caption # Get original text/caption
-        if success:
-            status_text = "\n\n✅ *Noticia enviada al webhook.*"
-            new_reply_markup = None # Remove button
-        else:
-            status_text = "\n\n❌ *Error al enviar al webhook.*"
-            new_reply_markup = None # Remove button
-
-        final_text = (new_text or "") + status_text
-
-        if original_message.photo:
-             # Ensure final caption is within limits
-            if len(final_text) > TELEGRAM_CAPTION_LIMIT:
-                diff = len(final_text) - TELEGRAM_CAPTION_LIMIT
-                original_trimmed = (new_text or "")[:-(diff + 3)] + "..."
-                final_text = original_trimmed + status_text
-
-            await callback_query.edit_message_caption(
-                caption=final_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=new_reply_markup
-            )
-        else:
-            if len(final_text) > 4096:
-                 final_text = final_text[:4093] + "..."
-            await callback_query.edit_message_text(
-                text=final_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=new_reply_markup,
-                disable_web_page_preview=True
-            )
-        logger.info(f"Edited Telegram message for article ID {article_id}. Webhook success: {success}")
-
-    except TelegramError as e:
-        if "message is not modified" in str(e):
-             logger.warning(f"Message for article ID {article_id} was already edited or not modified.")
-        else:
-             logger.error(f"Failed to edit Telegram message for article ID {article_id}: {e}", exc_info=True)
+    except requests.exceptions.RetryError as e:
+         logger.error(f"ImgBB upload failed after multiple retries: {e}", exc_info=True)
+         return None
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout error during an ImgBB upload attempt.")
+        return None
+    except requests.exceptions.RequestException as e:
+        status = e.response.status_code if e.response is not None else "N/A"
+        response_text = e.response.text[:500] if e.response is not None else "N/A"
+        logger.error(f"Error ({status}) uploading image to ImgBB: {e}. Response: {response_text}", exc_info=True)
+        return None
     except Exception as e:
-         logger.error(f"Unexpected error editing Telegram message for article ID {article_id}: {e}", exc_info=True)
+        logger.error(f"Unexpected error during ImgBB upload: {e}", exc_info=True)
+        return None
 
-# --- Test Command Function ---
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def upload_to_imgbb_async(image_base64: str, filename: str | None = None) -> str | None:
+    """Uploads a base64 image string to ImgBB asynchronously using a session with retries."""
+    if not image_base64:
+        logger.warning("No image base64 provided to upload_to_imgbb_async.")
+        return None
+    session = _create_upload_session()
+    # Pass base64 string directly
+    result = await asyncio.to_thread(_upload_to_imgbb_sync, session, image_base64, filename)
+    session.close()
+    return result
+
+# --- Modified Image Generation via Script --- (Adjusted to call ImgBB upload)
+async def generate_and_upload_image_via_script_async(prompt: str) -> str | None:
     """
-    Fetches the latest article from a random feed source, attempts to generate
-    an image, and sends it to the Telegram group as a test message without
-    saving to the DB or checking duplicates.
+    Calls test2.py script to generate an image, gets base64, uploads to ImgBB,
+    and returns the ImgBB URL on success. Returns None on failure.
     """
-    user = update.effective_user
-    logger.info(f"Received /test command from {user.username or user.first_name} (ID: {user.id})")
+    if not IMAGE_GENERATION_ENABLED:
+        logger.debug("Image generation is disabled. Skipping.")
+        return None
 
-    if not NEWS_URLS:
-        await update.message.reply_text("⚠️ No hay fuentes de noticias (NEWS_URLS) configuradas.")
-        return
+    command = [
+        sys.executable,
+        'test2.py',
+        '--prompt', prompt
+    ]
 
-    await update.message.reply_text("⚙️ Intentando obtener y enviar una noticia de prueba desde una fuente aleatoria...")
-
-    # 1. Select a random feed URL
-    feed_url = random.choice(NEWS_URLS)
-    logger.info(f"[/test] Selected random feed: {feed_url}")
-
-    article_to_send = None
-    try:
-        # 2. Fetch the feed
-        feed_data = await asyncio.to_thread(
-            feedparser.parse, feed_url,
-            request_headers={'User-Agent': 'NewsBot/1.0 (+http://yourdomain.com/newsbotinfo)'}
-        )
-
-        if feed_data.bozo:
-            logger.warning(f"[/test] Feed potentially malformed: {feed_url}. Reason: {feed_data.bozo_exception}")
-        if not feed_data.entries:
-            logger.warning(f"[/test] No entries found in feed: {feed_url}")
-            await update.message.reply_text(f"⚠️ No se encontraron artículos en la fuente seleccionada ({feed_url}). Intenta de nuevo.")
-            return
-
-        # 3. Select the first valid entry
-        for entry in feed_data.entries:
-            article_url = getattr(entry, 'link', None)
-            article_title = getattr(entry, 'title', None)
-            if not article_url or not article_title: continue
-
-            article_url = urljoin(feed_url, article_url) # Ensure URL is absolute
-
-            logger.info(f"[/test] Found article candidate: '{article_title}' ({article_url})")
-
-            # 4. Extract data
-            summary = getattr(entry, 'summary', getattr(entry, 'description', None))
-            original_image_url = None
-            if 'media_content' in entry and entry.media_content:
-                original_image_url = entry.media_content[0].get('url')
-            elif 'links' in entry:
-                for link in entry.links:
-                    if link.get('rel') == 'enclosure' and link.get('type','').startswith('image/'):
-                        original_image_url = link.get('href'); break
-
-            # 5. Clean summary
-            cleaned_summary = summary
-            if "reddit.com" in feed_url and cleaned_summary:
-                try:
-                    soup = BeautifulSoup(cleaned_summary, 'html.parser')
-                    cleaned_summary = soup.get_text(separator=' ', strip=True)
-                    logger.debug(f"[/test] Cleaned HTML tags from Reddit summary.")
-                except Exception as e:
-                    logger.warning(f"[/test] Could not clean HTML tags from summary: {e}")
-            if cleaned_summary:
-                try:
-                    cleaned_summary = html.unescape(cleaned_summary)
-                    logger.debug(f"[/test] Unescaped HTML entities.")
-                except Exception as e:
-                    logger.warning(f"[/test] Could not unescape HTML entities: {e}")
-
-            # Store details and break loop (we only want the first one)
-            article_to_send = {
-                'url': article_url,
-                'title': article_title,
-                'summary': cleaned_summary or "",
-                'original_image_url': original_image_url,
-                'source_feed': feed_url
-            }
-            break # Found the first valid article
-
-        if not article_to_send:
-            logger.warning(f"[/test] No valid articles with title and link found in feed: {feed_url}")
-            await update.message.reply_text(f"⚠️ No se encontraron artículos válidos en la fuente seleccionada ({feed_url}). Intenta de nuevo.")
-            return
-
-    except Exception as e:
-        logger.error(f"[/test] Failed to process feed URL {feed_url}: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error al procesar la fuente: {feed_url}")
-        return
-
-    # 6. Attempt Image Generation (Bypassing DB/Dedupe checks)
-    logger.info(f"[/test] Attempting image generation for: {article_to_send['title']}")
-    generated_image_url = await generate_and_upload_image_async(
-        article_to_send['title'],
-        article_to_send['summary']
+    logger.info(f"Executing image generation script: test2.py")
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
 
-    # 7. Determine final image URL
-    final_image_url = generated_image_url if generated_image_url else article_to_send['original_image_url']
-    logger.info(f"[/test] Final image URL selected: {final_image_url}")
+    stdout, stderr = await process.communicate()
+    stdout_decoded = stdout.decode().strip() if stdout else ""
+    stderr_decoded = stderr.decode().strip() if stderr else ""
 
-    # 8. Send the single test article to Telegram
-    # Using article_id=0 as it's not stored and callback is irrelevant for test
-    test_title = f"[TEST] {article_to_send['title']}"
-    message_id = await send_to_telegram_group(
-        context,
-        article_id=0, # Dummy ID for test
-        title=test_title,
-        url=article_to_send['url'],
-        summary=article_to_send['summary'],
-        image_url=final_image_url,
-        source_feed=article_to_send['source_feed']
-    )
+    if process.returncode != 0 or not stdout_decoded:
+        logger.error(f"Image generation script failed (Code: {process.returncode}) or produced no stdout.")
+        if stderr_decoded: logger.error(f"Script stderr: {stderr_decoded}")
+        return None
 
-    # 9. Report result
-    if message_id:
-        result_message = f"✅ Mensaje de prueba enviado al grupo desde {feed_url}."
-        logger.info(f"Test command finished successfully for {user.username or user.first_name}.")
+    image_base64 = stdout_decoded
+    logger.info(f"Image generation script succeeded. Received base64 data ({len(image_base64)} chars).")
+
+    # No decoding needed here, pass base64 directly to ImgBB upload function
+    # try: ... image_bytes = base64.b64decode(image_base64) ... except # Removed
+
+    # Upload the base64 string to ImgBB
+    imgbb_url = await upload_to_imgbb_async(image_base64) # Pass base64 string
+
+    if imgbb_url:
+        logger.info(f"Successfully generated and uploaded image to ImgBB: {imgbb_url}")
+        return imgbb_url
     else:
-        result_message = f"❌ Falló el envío del mensaje de prueba desde {feed_url} al grupo."
-        logger.error(f"Test command failed for {user.username or user.first_name}.")
-
-    await update.message.reply_text(result_message)
+        logger.error("Failed to upload generated image to ImgBB.")
+        return None
 
 # --- Function to Populate DB Initially (Synchronous) ---
 def populate_initial_db():
@@ -706,7 +429,7 @@ def populate_initial_db():
     processed_urls_population = set()
 
     for feed_url in NEWS_URLS:
-        logger.info(f"[Population] Checking feed: {feed_url}")
+        logger.debug(f"[Population] Checking feed: {feed_url}")
         try:
             socket.setdefaulttimeout(FEED_REQUEST_TIMEOUT)
             feed_data = feedparser.parse(feed_url)
@@ -715,10 +438,12 @@ def populate_initial_db():
             if feed_data.bozo:
                 logger.warning(f"[Population] Feed potentially malformed: {feed_url}. Reason: {feed_data.bozo_exception}")
             if not feed_data.entries:
+                logger.debug(f"[Population] No entries found in feed: {feed_url}")
                 continue
 
             added_count = 0
             skipped_count = 0
+            logger.debug(f"[Population] Processing {len(feed_data.entries)} entries for {feed_url}")
             for entry in feed_data.entries:
                 article_url = getattr(entry, 'link', None)
                 article_title = getattr(entry, 'title', None)
@@ -728,10 +453,8 @@ def populate_initial_db():
                 if article_url in processed_urls_population: continue
                 processed_urls_population.add(article_url)
 
-                # Only add if it doesn't exist. Fetch summary/image for DB now.
                 if not article_exists(article_url):
                     summary = getattr(entry, 'summary', getattr(entry, 'description', None))
-                    # Clean HTML from summary if it's from Reddit
                     if "reddit.com" in feed_url and summary:
                         try:
                             soup = BeautifulSoup(summary, 'html.parser')
@@ -739,7 +462,6 @@ def populate_initial_db():
                             logger.debug(f"[Population] Cleaned HTML tags from Reddit summary for: {article_url}")
                         except Exception as e:
                             logger.warning(f"[Population] Could not clean HTML tags from summary for {article_url}: {e}")
-                    # Unescape HTML entities for all summaries
                     if summary:
                         try:
                             summary = html.unescape(summary)
@@ -747,7 +469,6 @@ def populate_initial_db():
                         except Exception as e:
                             logger.warning(f"[Population] Could not unescape HTML entities for {article_url}: {e}")
 
-                    # Extract image URL from feed ONLY for population
                     feed_image_url = None
                     if 'media_content' in entry and entry.media_content:
                         feed_image_url = entry.media_content[0].get('url')
@@ -757,48 +478,243 @@ def populate_initial_db():
                                 feed_image_url = link.get('href')
                                 break
 
-                    # Add article with the feed image URL (or None)
-                    add_article(article_url, article_title, summary, feed_image_url, feed_url)
-                    added_count += 1
+                    if add_article(article_url, article_title, summary, feed_image_url, feed_url):
+                        added_count += 1
                 else:
                     skipped_count += 1
-            logger.info(f"[Population] Finished feed {feed_url}. Added: {added_count}, Skipped: {skipped_count}")
+            logger.info(f"[Population] Finished feed {feed_url}. Added: {added_count}, Skipped (already existed): {skipped_count}")
 
         except socket.timeout:
             logger.error(f"[Population] Timeout error fetching feed: {feed_url}")
         except Exception as e:
             logger.error(f"[Population] Failed to process feed URL {feed_url}: {e}", exc_info=True)
-        time.sleep(0.5) # Shorter delay during population
+        time.sleep(0.5)
 
     logger.info("Initial database population finished.")
-    socket.setdefaulttimeout(None) # Reset just in case
+    socket.setdefaulttimeout(None)
 
-# --- Main Job Function (Now Async for PTB Job Queue) ---
-async def check_news(context: ContextTypes.DEFAULT_TYPE):
-    """The main async job function executed by the Job Queue."""
+# --- Telegram Functions ---
+async def send_to_telegram_chat(
+    bot: ContextTypes.DEFAULT_TYPE.bot,
+    chat_id: str,
+    article_id: int,
+    title: str,
+    url: str,
+    summary: str | None,
+    image_url: str | None # Should always be a URL or None now
+):
+    """Sends the article details to Telegram, expects image_url to be a URL."""
+    try:
+        text = f"📰 <b>{html.escape(title)}</b>\n\n"
+        if summary:
+            max_summary_len = 500
+            summary_snippet = summary[:max_summary_len] + ('...' if len(summary) > max_summary_len else '')
+            text += f"{html.escape(summary_snippet)}\n\n"
+        text += f'<a href="{url}">Leer más</a>'
+
+        keyboard = [[InlineKeyboardButton("⬆️ Subir Noticia", callback_data=str(article_id))]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        log_title_short = title[:50] + '...' if len(title) > 50 else title
+
+        if image_url and image_url.startswith("http"): # Check if it's a URL
+            # Handle URL image
+            logger.info(f"Enviando a Telegram (con imagen URL: {image_url}) para ID {article_id}: '{log_title_short}'")
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_url,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                read_timeout=TELEGRAM_TIMEOUT,
+                write_timeout=TELEGRAM_TIMEOUT,
+                connect_timeout=TELEGRAM_TIMEOUT
+            )
+        else:
+            if image_url: # Log if a non-URL was somehow passed
+                logger.warning(f"Invalid image_url format received: '{image_url}'. Sending without image for ID {article_id}.")
+            # No image_url provided or it was invalid
+            logger.info(f"Enviando a Telegram (sin imagen) para ID {article_id}: '{log_title_short}'")
+            await bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup, disable_web_page_preview=True,
+                read_timeout=TELEGRAM_TIMEOUT, write_timeout=TELEGRAM_TIMEOUT,
+                connect_timeout=TELEGRAM_TIMEOUT
+            )
+        return True
+    except TelegramError as e:
+        # Log specific network errors differently
+        if isinstance(e, telegram.error.NetworkError):
+             logger.error(f"Error de RED al enviar mensaje a Telegram para artículo ID {article_id}. Imagen URL: {image_url}. Error: {e}", exc_info=True)
+        else:
+             logger.error(f"Error general de Telegram al enviar mensaje para artículo ID {article_id}. Imagen URL: {image_url}. Error: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f"Error inesperado al enviar mensaje a Telegram para artículo ID {article_id}. Imagen URL: {image_url}. Error: {e}", exc_info=True)
+        return False
+
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles button presses on Telegram messages."""
+    query = update.callback_query
+    await query.answer("Procesando...") # Acknowledge button press
+
+    try:
+        article_id = int(query.data)
+        logger.info(f"Botón 'Subir Noticia' presionado para artículo ID: {article_id}")
+    except (ValueError, TypeError):
+        logger.error(f"Error: callback_data inválido recibido: {query.data}")
+        await query.edit_message_text(text=f"{query.message.caption or query.message.text}\n\n⚠️ Error: ID de artículo inválido.", parse_mode=ParseMode.HTML)
+        return
+
+    article_details = await get_article_details_async(article_id)
+
+    if not article_details:
+        logger.error(f"No se encontraron detalles en la BD para el artículo ID: {article_id}")
+        await query.edit_message_text(
+            text=f"{query.message.caption or query.message.text}\n\n⚠️ Error: No se encontró el artículo en la base de datos.",
+            parse_mode=ParseMode.HTML # Keep original formatting if possible
+        )
+        return
+
+    webhook_data = {
+        'title': article_details['title'],
+        'url': article_details['url'],
+        'summary': article_details['summary'] or "",
+        'image_url': article_details['image_url'],
+        'source_feed': article_details['source_feed'],
+    }
+
+    logger.info(f"Enviando artículo ID {article_id} al webhook...")
+    success = await send_to_webhook_async(webhook_data)
+
+    if success:
+        logger.info(f"Artículo ID {article_id} enviado correctamente al webhook.")
+        # Edit message to show success and remove button
+        original_text = query.message.caption if query.message.photo else query.message.text
+        await query.edit_message_caption(
+             caption=f"{original_text}\n\n✅ <b>¡Enviado al webhook!</b>",
+             parse_mode=ParseMode.HTML
+        ) if query.message.photo else await query.edit_message_text(
+             text=f"{original_text}\n\n✅ <b>¡Enviado al webhook!</b>",
+             parse_mode=ParseMode.HTML,
+             disable_web_page_preview=True # Match original setting
+        )
+    else:
+        logger.error(f"Fallo al enviar artículo ID {article_id} al webhook.")
+        await query.edit_message_caption(
+            caption=f"{query.message.caption or query.message.text}\n\n❌ <b>Error al enviar al webhook.</b>",
+            parse_mode=ParseMode.HTML
+        ) if query.message.photo else await query.edit_message_text(
+            text=f"{query.message.caption or query.message.text}\n\n❌ <b>Error al enviar al webhook.</b>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True # Match original setting
+        )
+
+
+# --- Test Command Handler ---
+async def test_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /test command to send a dummy article for approval."""
+    user = update.effective_user
+    chat = update.effective_chat
+    bot = context.bot
+
+    logger.info(f"Comando /test recibido de {user.username or user.first_name} en chat {chat.id}")
+
+    # Crear datos dummy
+    timestamp = int(time.time())
+    dummy_title = f"[TEST] Noticia de Prueba - {timestamp}"
+    dummy_url = f"urn:script:test:{timestamp}" # URL única para la prueba
+    dummy_summary = f"Este es un resumen de prueba generado por el comando /test a las {time.strftime('%Y-%m-%d %H:%M:%S')}."
+    dummy_placeholder_image_url = "https://via.placeholder.com/1024x1024.png?text=Test+Image" # Placeholder image
+    dummy_source_feed = "Comando /test"
+
+    logger.info(f"Generando artículo de prueba: '{dummy_title}'")
+
+    # Intentar generar y subir una imagen real para la prueba
+    generated_imgbb_url = None
+    if IMAGE_GENERATION_ENABLED:
+        logger.info("Intentando generar y subir imagen de prueba...")
+        test_prompt = f"A simple, visually appealing graphic representing a 'Test News Article' generated at {timestamp}. Include a checkmark or a gear icon."
+        # Call the function which now uploads to ImgBB
+        generated_imgbb_url = await generate_and_upload_image_via_script_async(test_prompt)
+        if generated_imgbb_url:
+            logger.info(f"Imagen de prueba generada y subida a ImgBB exitosamente: {generated_imgbb_url}")
+        else:
+            logger.warning("Fallo al generar o subir la imagen de prueba a ImgBB, se usará placeholder.")
+
+    # Use ImgBB URL or placeholder
+    final_image_url_for_test = generated_imgbb_url or dummy_placeholder_image_url
+
+    # Añadir a la base de datos para obtener un ID, usando la URL final
+    article_id = await add_article_async(
+        dummy_url,
+        dummy_title,
+        dummy_summary,
+        final_image_url_for_test, # Saves ImgBB URL or placeholder
+        dummy_source_feed
+    )
+
+    if not article_id:
+        logger.error("No se pudo añadir el artículo de prueba a la base de datos.")
+        await update.message.reply_text("❌ Error: No se pudo guardar el artículo de prueba en la base de datos.")
+        # No temporary file to clean up here
+        return
+
+    logger.info(f"Artículo de prueba añadido a BD con ID: {article_id}. Enviando a Telegram para aprobación...")
+
+    # Enviar al chat de Telegram configurado para aprobación, usando la URL final
+    success = await send_to_telegram_chat(
+        bot=bot,
+        chat_id=TELEGRAM_CHAT_ID,
+        article_id=article_id,
+        title=dummy_title,
+        url=dummy_url,
+        summary=dummy_summary,
+        image_url=final_image_url_for_test # Pasa la URL de ImgBB o la URL placeholder
+    )
+
+    if success:
+        logger.info(f"Artículo de prueba (ID: {article_id}) enviado correctamente a {TELEGRAM_CHAT_ID}.")
+        # Informar al usuario que lo ejecutó (en el chat original)
+        await update.message.reply_text(f"✅ ¡Artículo de prueba enviado al chat configurado ({TELEGRAM_CHAT_ID}) para aprobación!")
+    else:
+        logger.error(f"Fallo al enviar el artículo de prueba (ID: {article_id}) a Telegram ({TELEGRAM_CHAT_ID}).")
+        await update.message.reply_text(f"❌ Error: No se pudo enviar el artículo de prueba al chat configurado ({TELEGRAM_CHAT_ID}). Revisa los logs.")
+        # Note: send_to_telegram_chat should handle cleanup of temp image if it failed sending it
+
+
+# --- Main Job Function (Async) ---
+async def check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
+    """The main async job function to check feeds and send to Telegram."""
     logger.info("Starting news check cycle...")
+    # Fetch recent articles *within* the cycle if deduplication is needed per-cycle
+    # Otherwise, it's mainly for the AI check
     recent_db_articles = await get_recent_articles_async()
+    processed_articles_in_cycle = 0
+    bot = context.bot # Get bot instance from context
 
     for feed_url in NEWS_URLS:
         logger.info(f"Checking feed: {feed_url}")
-        new_articles_found_feed = 0
-        processed_urls_this_cycle = set() # Track URLs processed within this feed fetch
+        processed_urls_this_feed = set() # Track URLs processed in *this specific feed check*
 
         try:
-            # Fetch and parse feed data
+            # Use a User-Agent
+            headers = {'User-Agent': f'AINewsRecolektor/1.0 ({WEBHOOK_URL})'}
             feed_data = await asyncio.to_thread(
                 feedparser.parse, feed_url,
-                request_headers={'User-Agent': 'NewsBot/1.0 (+http://yourdomain.com/newsbotinfo)'}
+                request_headers=headers,
+                etag=None, # Consider adding etag/modified handling if needed
+                agent=headers['User-Agent'] # feedparser uses 'agent'
             )
-            # ... (bozo check, no entries check remain the same) ...
+            # Reset default socket timeout just in case feedparser changed it
+            # socket.setdefaulttimeout(None) # Probably not needed with asyncio.to_thread
+
             if feed_data.bozo:
                  logger.warning(f"Feed potentially malformed: {feed_url}. Reason: {feed_data.bozo_exception}")
             if not feed_data.entries:
-                 logger.info(f"No entries found in feed: {feed_url}")
-                 continue # Correct indentation for continue
+                 logger.debug(f"No entries found in feed: {feed_url}")
+                 continue
 
-
-            logger.info(f"Found {len(feed_data.entries)} entries in feed: {feed_url}")
+            logger.debug(f"Found {len(feed_data.entries)} entries in feed: {feed_url}")
 
             for entry in feed_data.entries:
                 article_url = getattr(entry, 'link', None)
@@ -806,107 +722,170 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                 if not article_url or not article_title: continue
 
                 article_url = urljoin(feed_url, article_url)
-                if article_url in processed_urls_this_cycle: continue
-                processed_urls_this_cycle.add(article_url)
+                if article_url in processed_urls_this_feed: continue # Avoid processing same URL multiple times in one fetch
+                processed_urls_this_feed.add(article_url)
 
-                # 1. Check DB for URL existence (Async)
                 if await article_exists_async(article_url):
-                    logger.debug(f"Article already in DB: {article_url}")
+                    # logger.debug(f"Article already in DB: {article_url}") # Can be very verbose
                     continue
 
                 logger.info(f"Found potential new article: '{article_title}' ({article_url})")
 
-                # --- Extract summary and potentially original image ---
                 summary = getattr(entry, 'summary', getattr(entry, 'description', None))
-                original_image_url = None # Extract original image URL as fallback
+                original_image_url = None
+                # Extract image URL from feed entry more robustly
                 if 'media_content' in entry and entry.media_content:
-                    original_image_url = entry.media_content[0].get('url')
-                elif 'links' in entry:
+                     img_urls = [item.get('url') for item in entry.media_content if item.get('medium') == 'image' and item.get('url')]
+                     if img_urls: original_image_url = img_urls[0]
+                if not original_image_url and 'links' in entry:
                     for link in entry.links:
                          if link.get('rel') == 'enclosure' and link.get('type','').startswith('image/'):
                             original_image_url = link.get('href'); break
+                # Fallback: Check for images in summary HTML (less reliable)
+                if not original_image_url and summary:
+                    try:
+                        img_soup = BeautifulSoup(summary, 'html.parser')
+                        img_tag = img_soup.find('img')
+                        if img_tag and img_tag.get('src'):
+                            original_image_url = urljoin(article_url, img_tag['src'])
+                            logger.debug(f"Extracted image from summary/description: {original_image_url}")
+                    except Exception: pass # Ignore parsing errors
 
-                # Clean HTML from summary (Reddit specific and general unescape)
-                cleaned_summary = summary # Start with original summary
-                if "reddit.com" in feed_url and cleaned_summary:
+                cleaned_summary = summary
+                if cleaned_summary: # Clean summary *after* trying to extract image from it
                     try:
                         soup = BeautifulSoup(cleaned_summary, 'html.parser')
-                        cleaned_summary = soup.get_text(separator=' ', strip=True)
-                        logger.debug(f"Cleaned HTML tags from Reddit summary for: {article_url}")
-                    except Exception as e:
-                        logger.warning(f"Could not clean HTML tags from summary for {article_url}: {e}")
-                if cleaned_summary:
-                    try:
+                        # Remove potentially problematic tags but keep basic formatting if desired
+                        for tag in soup(["script", "style", "iframe"]):
+                            tag.decompose()
+                        # Get text, preserving line breaks from <p>, <br> might be useful
+                        cleaned_summary = soup.get_text(separator='\n', strip=True)
+                        # Unescape HTML entities last
                         cleaned_summary = html.unescape(cleaned_summary)
-                        logger.debug(f"Unescaped HTML entities for: {article_url}")
+                        logger.debug(f"Cleaned summary for: {article_url}")
                     except Exception as e:
-                        logger.warning(f"Could not unescape HTML entities for {article_url}: {e}")
+                        logger.warning(f"Could not clean summary for {article_url}: {e}")
+                        cleaned_summary = html.unescape(summary) # Basic unescape as fallback
 
 
-                # 2. AI Deduplication Check (Async)
                 is_ai_duplicate = await is_duplicate_async(article_title, cleaned_summary, recent_db_articles)
                 if is_ai_duplicate:
-                     logger.info(f"Article determined as duplicate by AI, skipping: {article_title}")
+                     logger.info(f"[AI DEDUPE] Article determined as duplicate, skipping: {article_title}")
                      continue
 
-                # --- Generate and Upload Image ---
-                generated_image_url = await generate_and_upload_image_async(article_title, cleaned_summary)
+                # Generate and upload image using the script if needed
+                generated_imgbb_url = None
+                if not original_image_url and IMAGE_GENERATION_ENABLED: # Only generate if no original image
+                     image_prompt = ( # Construct the prompt here
+                         f"Generate an engaging Instagram-style thumbnail representing the following news article. "
+                         f"Focus on the core subject visually. Avoid text, or use at most 1-2 relevant words clearly. "
+                         f"News Title: {article_title}. Summary: {(cleaned_summary or '')[:500]}..."
+                     )
+                     generated_imgbb_url = await generate_and_upload_image_via_script_async(image_prompt)
 
-                # Determine final image URL (prefer generated, fallback to original feed image)
-                final_image_url = generated_image_url if generated_image_url else original_image_url
+                # Determine final image URL for DB and Telegram
+                # Priority: Generated ImgBB URL > Original feed URL
+                final_image_url = generated_imgbb_url or original_image_url
 
-                # 3. Add to DB first to get ID (Async) - Store the final determined image URL
+                # Add article to DB *first* to get an ID
+                # The 'image_url' column will store the final URL (ImgBB or original)
                 article_id = await add_article_async(article_url, article_title, cleaned_summary, final_image_url, feed_url)
 
                 if not article_id:
-                     logger.warning(f"Failed to add article to DB or article already exists (race condition?), skipping Telegram send for: {article_url}")
-                     continue # Skip if we couldn't add it / get an ID
+                     logger.warning(f"Failed to add article to DB for: {article_url}. Skipping Telegram send.")
+                     # No temporary file to clean up
+                     continue
 
-                # 4. Send to Telegram Group with the obtained ID and final image URL (Async)
-                message_id = await send_to_telegram_group(
-                    context, article_id, article_title, article_url, cleaned_summary or "", final_image_url, feed_url
+                # Send to Telegram using the final URL
+                success = await send_to_telegram_chat(
+                    bot=bot,
+                    chat_id=TELEGRAM_CHAT_ID,
+                    article_id=article_id,
+                    title=article_title,
+                    url=article_url,
+                    summary=cleaned_summary,
+                    image_url=final_image_url # Pass the final URL
                 )
 
-                if message_id:
-                    # Article already added, just update counts and recent list
-                    new_articles_found_feed += 1
-                    recent_db_articles.insert(0, {'title': article_title, 'url': article_url}) # Keep recent list based on URL/title for dedupe
+                if success:
+                    processed_articles_in_cycle += 1
+                    # Update recent articles list for *next* AI check if needed
+                    recent_db_articles.insert(0, {'title': article_title, 'url': article_url}) # Keep this for dedupe context
                     if len(recent_db_articles) > MAX_RECENT_ARTICLES_FOR_CHECK: recent_db_articles.pop()
+                    logger.info(f"Article ID {article_id} sent to Telegram for approval.")
                 else:
-                    # If sending fails, we ideally should remove the article from the DB or mark it as failed,
-                    # otherwise it won't be picked up again. For now, just log the error.
-                    # Consider adding a 'sent_to_telegram' flag to the DB later.
-                    logger.error(f"Failed to send article ID {article_id} to Telegram: {article_title}")
+                     logger.error(f"Failed to send article ID {article_id} to Telegram.")
+                     # Note: send_to_telegram_chat might have already cleaned up the image on failure to send local file
 
-                await asyncio.sleep(1.5) # Slightly increased delay to accommodate image generation/upload time
+                await asyncio.sleep(1.5) # Be nice
 
-            logger.info(f"Finished checking {feed_url}. Processed {new_articles_found_feed} new articles.")
+            logger.info(f"Finished checking {feed_url}. Found {len(processed_urls_this_feed)} potential articles. Sent {processed_articles_in_cycle} new unique articles to Telegram in this cycle so far.")
 
+        except socket.timeout:
+            logger.error(f"Timeout error fetching feed: {feed_url}")
         except Exception as e:
             logger.error(f"Failed to process feed URL {feed_url}: {e}", exc_info=True)
 
-        await asyncio.sleep(2) # Increased delay between feeds
+        await asyncio.sleep(2) # Wait between feeds
 
-    logger.info(f"News check cycle finished. Next run scheduled in {CHECK_INTERVAL_SECONDS / 60} minutes.")
+    logger.info(f"News check cycle finished. Sent {processed_articles_in_cycle} new articles to Telegram in this cycle.")
+
+
+# --- Post-Initialization Function for Bot ---
+async def post_init(application: Application):
+    """Runs after bot initialization and schedules the job."""
+    # Removed the startup test message call
+    # await send_test_telegram_message(application.bot)
+    logger.info("Bot inicializado. Programando ciclo de revisión de noticias...")
+
+    # Schedule the news check job
+    job_queue = application.job_queue
+    job_queue.run_repeating(
+        check_news_cycle,
+        interval=CHECK_INTERVAL_SECONDS,
+        first=10, # Run first check 10 seconds after startup
+        name="check_news_cycle_job"
+    )
+    logger.info(f"Scheduled news check job to run every {CHECK_INTERVAL_SECONDS} seconds.")
+    logger.info("Bot listo y JobQueue iniciado.")
+
 
 # --- Main Execution ---
 if __name__ == "__main__":
+    logger.info("Inicializando script...")
     init_db()
-    populate_initial_db()
+    logger.info("Ejecutando poblado inicial de la base de datos...")
+    populate_initial_db() # Run initial population synchronously before starting bot
 
-    logger.info("Setting up Telegram Bot Application...")
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    logger.info("Configurando y iniciando el bot de Telegram...")
 
-    application.add_handler(CallbackQueryHandler(handle_button_press))
-    application.add_handler(CommandHandler("test", test_command))
+    # Build the application and set timeouts here
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        # Set timeouts for the HTTP client used by the bot
+        .connect_timeout(TELEGRAM_TIMEOUT)
+        .read_timeout(TELEGRAM_TIMEOUT)
+        .write_timeout(TELEGRAM_TIMEOUT)
+        .post_init(post_init) # Function to run after init
+        .concurrent_updates(True) # Handle multiple updates concurrently
+        .build()
+    )
 
-    job_queue = application.job_queue
-    if not job_queue:
-         logger.error("JobQueue not available. Please install with 'pip install \"python-telegram-bot[job-queue]\"'. Exiting.")
-         exit(1)
+    # --- Add Handlers ---
+    # Handler for button presses
+    application.add_handler(CallbackQueryHandler(button_callback_handler))
+    # Handler for the /test command
+    application.add_handler(CommandHandler("test", test_command_handler))
 
-    job_queue.run_repeating(check_news, interval=CHECK_INTERVAL_SECONDS, first=10)
-    logger.info(f"Scheduled news check job to run every {CHECK_INTERVAL_SECONDS} seconds.")
+    logger.info("Iniciando polling del bot...")
+    # Run the bot until the user presses Ctrl-C
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.critical(f"Error crítico en el polling del bot: {e}", exc_info=True)
+    finally:
+        logger.info("Deteniendo el bot.")
+        # asyncio tasks should be cancelled automatically by run_polling on exit
 
-    logger.info("Starting Telegram Bot Polling...")
-    application.run_polling()
+    logger.info("Script terminado.")
