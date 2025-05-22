@@ -6,7 +6,7 @@ import sys
 
 # --- Configuration ---
 # WARNING: Hardcoding API keys is generally discouraged.
-API_KEY = "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"
+API_KEY = "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"
 MODEL = "gpt-image-1"
 
 def generate_and_print_base64(prompt: str):
