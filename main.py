@@ -210,6 +210,29 @@ def get_article_details(article_id: int):
         logger.error(f"Database error retrieving article details for ID {article_id}: {e}", exc_info=True)
     return details
 
+async def update_article_image_async(article_id: int, image_url: str) -> bool:
+    """Updates the stored image URL for a specific article asynchronously."""
+    return await asyncio.to_thread(update_article_image, article_id, image_url)
+
+def update_article_image(article_id: int, image_url: str) -> bool:
+    """Updates the stored image URL for a specific article (blocking)."""
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE articles SET image_url = ? WHERE id = ?",
+                (image_url, article_id),
+            )
+            conn.commit()
+        logger.info(f"Updated image URL in DB for article ID {article_id}.")
+        return True
+    except sqlite3.Error as e:
+        logger.error(
+            f"Database error updating image URL for article ID {article_id}: {e}",
+            exc_info=True,
+        )
+        return False
+
 # --- Webhook Function ---
 async def send_to_webhook_async(data):
      """Sends data to the webhook asynchronously."""
@@ -576,11 +599,26 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    final_image_url = article_details['image_url']
+
+    # Only generate an image now if there was none from the feed
+    generated_imgbb_url = None
+    if not final_image_url and IMAGE_GENERATION_ENABLED:
+        image_prompt = (
+            f"Generate an engaging Instagram-style thumbnail representing the following news article. "
+            f"Focus on the core subject visually. Avoid text, or use at most 1-2 relevant words clearly. "
+            f"News Title: {article_details['title']}. Summary: {(article_details['summary'] or '')[:500]}..."
+        )
+        generated_imgbb_url = await generate_and_upload_image_via_script_async(image_prompt)
+        if generated_imgbb_url:
+            final_image_url = generated_imgbb_url
+            await update_article_image_async(article_id, final_image_url)
+
     webhook_data = {
         'title': article_details['title'],
         'url': article_details['url'],
         'summary': article_details['summary'] or "",
-        'image_url': article_details['image_url'],
+        'image_url': final_image_url,
         'source_feed': article_details['source_feed'],
     }
 
@@ -774,19 +812,10 @@ async def check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                      logger.info(f"[AI DEDUPE] Article determined as duplicate, skipping: {article_title}")
                      continue
 
-                # Generate and upload image using the script if needed
-                generated_imgbb_url = None
-                if not original_image_url and IMAGE_GENERATION_ENABLED: # Only generate if no original image
-                     image_prompt = ( # Construct the prompt here
-                         f"Generate an engaging Instagram-style thumbnail representing the following news article. "
-                         f"Focus on the core subject visually. Avoid text, or use at most 1-2 relevant words clearly. "
-                         f"News Title: {article_title}. Summary: {(cleaned_summary or '')[:500]}..."
-                     )
-                     generated_imgbb_url = await generate_and_upload_image_via_script_async(image_prompt)
-
-                # Determine final image URL for DB and Telegram
-                # Priority: Generated ImgBB URL > Original feed URL
-                final_image_url = generated_imgbb_url or original_image_url
+                # Do NOT generate an image yet. This will be done only if the article
+                # is approved and sent to the webhook. Use the original feed image
+                # if available for the Telegram preview.
+                final_image_url = original_image_url
 
                 # Add article to DB *first* to get an ID
                 # The 'image_url' column will store the final URL (ImgBB or original)
