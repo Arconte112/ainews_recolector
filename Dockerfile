@@ -20,9 +20,7 @@ COPY test2.py .
 # Note: The script seems to handle directory creation, so explicitly creating it might be redundant
 # Depending on permissions, it might be safer to create it and set permissions if needed.
 
-# Make port 80 available to the world outside this container (if needed, e.g., for webhooks)
-# EXPOSE 80
-EXPOSE 3122
+# This service no longer exposes an HTTP API; it only runs the Telegram bot loop.
 
 # Define environment variables (example, override with -e at runtime)
 # ENV TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
