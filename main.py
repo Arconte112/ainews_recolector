@@ -39,7 +39,17 @@ load_dotenv()
 
 # --- Environment Variables & Constants ---
 # NEWS_URLS = json.loads(os.getenv('NEWS_URLS', '[]')) # Replaced with hardcoded list
-NEWS_URLS = ["https://techcrunch.com/category/artificial-intelligence/feed/", "https://www.wired.com/feed/tag/ai/latest/rss", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "https://arstechnica.com/tag/artificial-intelligence/feed/", "https://feed.infoq.com/ai-ml-data-eng/news", "https://futurism.com/categories/ai-artificial-intelligence/feed", "https://www.theguardian.com/technology/artificialintelligenceai/rss", "https://www.reddit.com/r/artificial/.rss,https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/tecnologia/portada"]
+NEWS_URLS = [
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "https://www.wired.com/feed/tag/ai/latest/rss",
+    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+    "https://arstechnica.com/tag/artificial-intelligence/feed/",
+    "https://feed.infoq.com/ai-ml-data-eng/news",
+    "https://futurism.com/categories/ai-artificial-intelligence/feed",
+    "https://www.theguardian.com/technology/artificialintelligenceai/rss",
+    "https://www.reddit.com/r/artificial/.rss",
+    "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/tecnologia/portada",
+]
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
 if not WEBHOOK_URL:
@@ -67,7 +77,7 @@ IMAGE_QUALITY = os.getenv('IMAGE_QUALITY', 'medium') # Changed default quality
 
 # CATBOX_API_URL = "https://catbox.moe/user/api.php" # Removed Catbox URL
 IMGBB_API_URL = "https://api.imgbb.com/1/upload"
-IMGBB_API_KEY = "fa96877128b39591c1286e74e07e0987" # Your ImgBB API Key
+IMGBB_API_KEY = os.getenv('IMGBB_API_KEY')
 
 GPT_MODEL = os.getenv('GPT_MODEL', "openai/gpt-4o-mini")
 DATABASE_NAME = 'news_log.db'
@@ -334,6 +344,10 @@ def _upload_to_imgbb_sync(session: requests.Session, image_base64: str, filename
     Synchronous helper to upload a base64 image string to ImgBB anonymously
     using a session with retries. Parses JSON response for URL.
     """
+    if not IMGBB_API_KEY:
+        logger.warning("IMGBB_API_KEY is not configured; skipping image upload.")
+        return None
+
     try:
         # ImgBB expects base64 string in the 'image' field of the payload
         payload = {

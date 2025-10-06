@@ -1,0 +1,7 @@
+news_log.db
+temp_images/
+audio/
+images/
+logs/
+__pycache__/
+*.pyc

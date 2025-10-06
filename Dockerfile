@@ -14,7 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY test2.py .
 # Copy the .env file (consider using Docker secrets or environment variables for production)
-COPY .env .
 
 # Create the directory for temporary images if it doesn't exist
 # RUN mkdir -p temp_images

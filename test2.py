@@ -6,7 +6,10 @@ import sys
 
 # --- Configuration ---
 # WARNING: Hardcoding API keys is generally discouraged.
-API_KEY = "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"
+API_KEY = os.getenv("OPENAI_API_KEY")
+if not API_KEY:
+    print("OPENAI_API_KEY is not set; exiting.", file=sys.stderr)
+    sys.exit(1)
 MODEL = "gpt-image-1"
 
 def generate_and_print_base64(prompt: str):
